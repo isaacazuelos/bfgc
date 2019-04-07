@@ -1,16 +1,22 @@
 #![allow(dead_code)]
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Type {
     Int,
     Pair,
 }
 
+#[derive(Debug)]
+enum Value {
+    Int(i64),
+    Pair(Option<*mut Object>, Option<*mut Object>),
+}
+
+#[derive(Debug)]
 struct Object {
     marked: bool,
     next: Option<*mut Object>,
-    tag: Type,
-    payload: Payload,
+    value: Value,
 }
 
 impl Object {
@@ -20,8 +26,7 @@ impl Object {
         }
         self.marked = true;
 
-        if self.tag == Type::Pair {
-            let (head, tail) = unsafe { self.payload.pair };
+        if let Value::Pair(head, tail) = self.value {
             if let Some(obj) = head {
                 unsafe { (*obj).mark() }
             }
@@ -32,14 +37,9 @@ impl Object {
     }
 }
 
-union Payload {
-    int: i64,
-    pair: (Option<*mut Object>, Option<*mut Object>),
-}
-
 struct VM {
-    stack: [Option<*mut Object>; VM::STACK_MAX],
-    stack_size: usize,
+    stack: Vec<*mut Object>,
+
     first_object: Option<*mut Object>,
     max_objects: usize,
     num_objects: usize,
@@ -50,35 +50,32 @@ impl VM {
     const INITIAL_GC_THRESHOLD: usize = 32;
     fn new() -> VM {
         VM {
-            stack: [None; VM::STACK_MAX],
-            stack_size: 0,
+            stack: Vec::new(),
             first_object: None,
             max_objects: VM::INITIAL_GC_THRESHOLD,
             num_objects: 0,
         }
     }
     fn mark_all(&mut self) {
-        for i in 0..self.stack_size {
-            if let Some(obj) = self.stack[i] {
-                unsafe {
-                    (*obj).mark();
-                };
-            }
+        for obj in &self.stack {
+            unsafe { (**obj).mark() };
         }
     }
+
     fn sweep(&mut self) {
-        let mut cursor = self.first_object;
-        
-        while let Some(object) = cursor {
-            unsafe {
-                if !(*object).marked {
-                    let unreachable: *mut Object = object;
-                    cursor = (*unreachable).next;
-                    Box::from_raw(unreachable);
+        // starting with a raw translation of the C
+        unsafe {
+            // Not going to lie -- double pointers are still mind bending.
+            let mut object = &mut self.first_object;
+            while object.is_some() {
+                if !(*object.unwrap()).marked {
+                    let unreached = *object;
+                    *object = (*unreached.unwrap()).next;
                     self.num_objects -= 1;
+                    drop(Box::from_raw(unreached.unwrap()));
                 } else {
-                    (*object).marked = false;
-                    cursor = (*object).next;
+                    (*object.unwrap()).marked = false;
+                    object = &mut (*object.unwrap()).next;
                 }
             }
         }
@@ -91,54 +88,43 @@ impl VM {
     }
 
     fn push(&mut self, value: *mut Object) {
-        assert!(self.stack_size < VM::STACK_MAX, "Stack overflow!");
-        self.stack[self.stack_size] = Some(value);
-        self.stack_size += 1;
+        self.stack.push(value);      
     }
     fn pop(&mut self) -> *mut Object {
-        assert!(self.stack_size > 0, "Stack underflow");
-        self.stack_size -= 1;
-        let obj = self.stack[self.stack_size];
-        obj.unwrap()
-    }
 
-    fn new_object(&mut self, object_type: Type) -> *mut Object {
+        self.stack.pop().expect("Stack underflow!")
+    }
+    fn new_object(&mut self) -> *mut Object {
         if self.num_objects == self.max_objects {
             self.gc();
         }
 
         self.num_objects += 1;
+        let value: Value = unsafe { ::std::mem::uninitialized() };
 
-        let payload = match object_type {
-            Type::Int => Payload { int: 0 },
-            Type::Pair => Payload { pair: (None, None) },
-        };
         let obj = Box::new(Object {
             marked: false,
             next: self.first_object,
-            tag: object_type,
-            payload,
+            value,
         });
-        let ptr = Box::into_raw(obj);
 
+        let ptr = Box::into_raw(obj);
         self.first_object = Some(ptr);
         ptr
     }
 
     fn push_int(&mut self, value: i64) {
-        let obj = VM::new_object(self, Type::Int);
+        let obj = self.new_object();
         unsafe {
-            (*obj).payload = Payload { int: value };
+            (*obj).value = Value::Int(value);
         };
         self.push(obj);
     }
 
     fn push_pair(&mut self) -> *mut Object {
-        let obj = VM::new_object(self, Type::Pair);
+        let obj = self.new_object();
         unsafe {
-            (*obj).payload = Payload {
-                pair: (Some(self.pop()), Some(self.pop())),
-            };
+            (*obj).value = Value::Pair(Some(self.pop()), Some(self.pop()));
         }
         self.push(obj);
         obj
@@ -195,8 +181,12 @@ mod tests {
         // Set up a cycle, and also make 2 and 4 unreachable and collectible
 
         unsafe {
-            (*a).payload.pair.1 = Some(b);
-            (*b).payload.pair.1 = Some(a);
+            if let Value::Pair(head, _) = (*a).value {
+                (*a).value = Value::Pair(head, Some(b));
+            }
+            if let Value::Pair(head, _) = (*b).value {
+                (*b).value = Value::Pair(head, Some(a));
+            }
         }
 
         vm.gc();
